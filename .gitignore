@@ -1,0 +1,62 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Android
+.gradle/
+local.properties
+*.jks
+*.keystore
+android/app/build/
+android/build/
+
+# Tauri / Rust
+desktop/src-tauri/target/
+
+# Node / JS
+node_modules/
+dist/
+.next/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# AWS / Infra secrets
+*.pem
+*.key
+terraform.tfstate
+terraform.tfstate.backup
+
+# Scratch files
+backend/task_debug.txt
+backend/test.py
+backend/test_target.txt
+backend/write_test.txt
+backend/tools_patch.py
+backend/watcher_apply_prompt.txt
+backend/watcher_draft_prompt.txt
+android/app/src/main/java/com/devc010/mcpapp/task.md
+
