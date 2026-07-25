@@ -15,10 +15,16 @@ import hashlib
 import json
 import uuid
 import logging
+import threading
 import tools
 from cachetools import TTLCache
 from datetime import datetime
 import httpx
+try:
+    from confluent_kafka import Producer, Consumer, KafkaError
+    _CONFLUENT_AVAILABLE = True
+except ImportError:
+    _CONFLUENT_AVAILABLE = False
 
 # ── DevMCP Task Workspace ─────────────────────────────────────
 DEVMCP_INBOX      = "C:/DevMCP/inbox"
@@ -39,6 +45,76 @@ log = logging.getLogger(__name__)
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(title="Dev-MCP", version="2.0.0")
+
+# ── Kafka producer ────────────────────────────────────────────
+_kafka_producer: "Producer | None" = None
+
+def _init_kafka_producer() -> None:
+    """Initialize the Confluent Kafka producer at server startup.
+    Defaults to PLAINTEXT so local dev works without Kafka.
+    Wraps in try/except so the server starts even if Kafka is unavailable.
+    """
+    global _kafka_producer
+    if not _CONFLUENT_AVAILABLE:
+        log.warning("confluent-kafka not installed — Kafka producer disabled.")
+        return
+
+    bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "")
+    if not bootstrap:
+        log.info("KAFKA_BOOTSTRAP_SERVERS not set — Kafka producer disabled (local dev mode).")
+        return
+
+    security_protocol = os.environ.get("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+    sasl_mechanism    = os.environ.get("KAFKA_SASL_MECHANISM", "")
+
+    conf: dict = {
+        "bootstrap.servers": bootstrap,
+        "security.protocol": security_protocol,
+        "client.id": "devmcp-reactive-agent",
+        "acks": "1",
+    }
+
+    # MSK IAM auth — only add SASL settings when a mechanism is specified
+    if sasl_mechanism:
+        conf["sasl.mechanism"] = sasl_mechanism
+        if sasl_mechanism.upper() == "AWS_MSK_IAM":
+            # MSK IAM uses the AWS credentials chain; no username/password needed
+            conf["sasl.oauthbearer.config"] = "principal=user"
+
+    try:
+        _kafka_producer = Producer(conf)
+        log.info(
+            f"Kafka producer initialized — bootstrap: {bootstrap}, "
+            f"protocol: {security_protocol}, sasl: {sasl_mechanism or 'none'}"
+        )
+    except Exception as exc:
+        log.warning(f"Kafka producer init failed (server will still start): {exc}")
+        _kafka_producer = None
+
+
+def _delivery_cb(err, msg) -> None:
+    """Kafka delivery report callback — only logs on failure."""
+    if err:
+        log.warning(f"Kafka delivery failed [{msg.topic()}]: {err}")
+
+
+def publish_event(topic: str, payload_dict: dict) -> None:
+    """Serialize payload_dict to JSON and produce to topic.
+    Never lets Kafka errors crash the main request flow.
+    """
+    if _kafka_producer is None:
+        return
+    try:
+        value = json.dumps(payload_dict, default=str).encode("utf-8")
+        _kafka_producer.produce(topic, value=value, callback=_delivery_cb)
+        _kafka_producer.poll(0)
+    except Exception as exc:
+        log.warning(f"publish_event({topic}) failed: {exc}")
+
+
+# ── Kafka consumer state ──────────────────────────────────────
+_kafka_consumer_stop = threading.Event()
+_kafka_consumer_thread: "threading.Thread | None" = None
 
 # ── Auth ──────────────────────────────────────────────────────
 _API_KEY_HEADER = APIKeyHeader(name="X-DevMCP-Key", auto_error=False)
@@ -520,6 +596,14 @@ async def execute_tool(name: str, arguments: dict) -> str:
             with open(DEVMCP_TRIGGER, "w") as f:
                 f.write(datetime.now().isoformat())
             log.info(f"Task queued [{mode}][{project_name}]: {task_id} -> {task_file}")
+            # ── Kafka: publish initial task status ────────────────────
+            publish_event("devmcp.status", {
+                "task_id": task_id,
+                "status": "pending",
+                "project_name": project_name,
+                "mode": mode,
+                "timestamp": datetime.now().isoformat(),
+            })
             return json.dumps({"task_id": task_id, "status": "queued", "mode": mode, "project_name": project_name})
 
         return f"Unknown tool: {name}"
@@ -681,7 +765,25 @@ async def _run_ai_job(request: AIRequest) -> dict:
                     tc_result = cached_result
                 else:
                     log.info(f"LLM tool call: {tc_name} with {tc_args}")
+                    # ── Kafka: tool_call_start event ──────────────
+                    _tool_start_ts = time.time()
+                    publish_event("devmcp.events", {
+                        "event": "tool_call_start",
+                        "tool": tc_name,
+                        "args": tc_args,
+                        "task_session": {"job_iteration": i, "prompt_preview": prompt[:100]},
+                        "timestamp": datetime.now().isoformat(),
+                    })
                     tc_result = await execute_tool(tc_name, tc_args)
+                    # ── Kafka: tool_call_complete event ───────────
+                    _tool_elapsed_ms = round((time.time() - _tool_start_ts) * 1000)
+                    publish_event("devmcp.events", {
+                        "event": "tool_call_complete",
+                        "tool": tc_name,
+                        "result_length": len(str(tc_result)),
+                        "elapsed_ms": _tool_elapsed_ms,
+                        "timestamp": datetime.now().isoformat(),
+                    })
                     log.info(f"Tool result for {tc_name} (first 200 chars): {str(tc_result)[:200]}")
 
                 messages.append({
@@ -706,7 +808,25 @@ async def _run_ai_job(request: AIRequest) -> dict:
                     sc_result = cached_result
                 else:
                     log.info(f"LLM short-circuit tool call: {sc_name} with {sc_args}")
+                    # ── Kafka: tool_call_start event (short-circuit) ──
+                    _sc_start_ts = time.time()
+                    publish_event("devmcp.events", {
+                        "event": "tool_call_start",
+                        "tool": sc_name,
+                        "args": sc_args,
+                        "task_session": {"job_iteration": i, "prompt_preview": prompt[:100]},
+                        "timestamp": datetime.now().isoformat(),
+                    })
                     sc_result = await execute_tool(sc_name, sc_args)
+                    # ── Kafka: tool_call_complete event (short-circuit) 
+                    _sc_elapsed_ms = round((time.time() - _sc_start_ts) * 1000)
+                    publish_event("devmcp.events", {
+                        "event": "tool_call_complete",
+                        "tool": sc_name,
+                        "result_length": len(str(sc_result)),
+                        "elapsed_ms": _sc_elapsed_ms,
+                        "timestamp": datetime.now().isoformat(),
+                    })
                     log.info(f"Short-circuit tool result (first 200 chars): {str(sc_result)[:200]}")
 
                 elapsed = round(time.time() - start, 3)
@@ -733,6 +853,14 @@ async def _run_ai_job(request: AIRequest) -> dict:
         ptd = last_usage.get("prompt_tokens_details", {})
         cached = ptd.get("cached_tokens", 0) if isinstance(ptd, dict) else 0
     log.info(f"AI response in {elapsed}s (cached_tokens: {cached})")
+    # ── Kafka: final_result event ─────────────────────────────
+    publish_event("devmcp.events", {
+        "event": "final_result",
+        "result_length": len(str(result)),
+        "total_elapsed_ms": round(elapsed * 1000),
+        "cached_tokens": cached,
+        "timestamp": datetime.now().isoformat(),
+    })
     return {"result": result, "elapsed_ms": elapsed * 1000}
 
 
@@ -870,6 +998,15 @@ async def approve_task(task_id: str, payload: TaskAction):
     with open(DEVMCP_TRIGGER, "w") as f:
         f.write(datetime.now().isoformat())
 
+    # ── Kafka: publish approval/rejection status ──────────────
+    publish_event("devmcp.status", {
+        "task_id": task_id,
+        "status": new_status,
+        "project_name": task.get("project_name", ""),
+        "mode": task.get("mode", ""),
+        "timestamp": datetime.now().isoformat(),
+    })
+
     return {"status": "success", "task_status": task["status"]}
 
 
@@ -990,6 +1127,106 @@ async def sweep_orphaned_tasks() -> None:
         )
     else:
         log.info("Orphan sweep complete — no stale task files found.")
+
+
+# ── Kafka producer startup ────────────────────────────────────
+@app.on_event("startup")
+async def start_kafka_producer() -> None:
+    """Initialize the Kafka producer on server startup."""
+    _init_kafka_producer()
+
+
+# ── Kafka consumer background thread ─────────────────────────
+def _kafka_consumer_loop() -> None:
+    """Background thread: consume devmcp.commands and log each message.
+    Does not process commands yet — establishes consumer infrastructure.
+    """
+    if not _CONFLUENT_AVAILABLE:
+        log.warning("confluent-kafka not installed — Kafka consumer disabled.")
+        return
+
+    bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "")
+    if not bootstrap:
+        log.info("KAFKA_BOOTSTRAP_SERVERS not set — Kafka consumer disabled (local dev mode).")
+        return
+
+    security_protocol = os.environ.get("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+    sasl_mechanism    = os.environ.get("KAFKA_SASL_MECHANISM", "")
+
+    conf: dict = {
+        "bootstrap.servers": bootstrap,
+        "group.id": "orbit-reactive-agent",
+        "security.protocol": security_protocol,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": True,
+    }
+    if sasl_mechanism:
+        conf["sasl.mechanism"] = sasl_mechanism
+        if sasl_mechanism.upper() == "AWS_MSK_IAM":
+            conf["sasl.oauthbearer.config"] = "principal=user"
+
+    try:
+        consumer = Consumer(conf)
+        consumer.subscribe(["devmcp.commands"])
+        log.info("Kafka consumer started — topic: devmcp.commands, group: orbit-reactive-agent")
+    except Exception as exc:
+        log.warning(f"Kafka consumer init failed (server will still run): {exc}")
+        return
+
+    try:
+        while not _kafka_consumer_stop.is_set():
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                log.warning(f"Kafka consumer error: {msg.error()}")
+                continue
+            key_str = msg.key().decode("utf-8") if msg.key() else "(no key)"
+            raw_val = msg.value() or b""
+            try:
+                val_preview = raw_val.decode("utf-8")[:200]
+            except Exception:
+                val_preview = repr(raw_val[:200])
+            log.info(
+                f"[Kafka] devmcp.commands | key={key_str} | "
+                f"value_preview={val_preview!r}"
+            )
+    finally:
+        consumer.close()
+        log.info("Kafka consumer closed.")
+
+
+@app.on_event("startup")
+async def start_kafka_consumer() -> None:
+    """Launch the Kafka consumer in a background thread via run_in_executor
+    so it does not block the FastAPI event loop.
+    """
+    global _kafka_consumer_thread
+    _kafka_consumer_stop.clear()
+    loop = asyncio.get_event_loop()
+    _kafka_consumer_thread = threading.Thread(
+        target=_kafka_consumer_loop,
+        name="kafka-consumer",
+        daemon=True,
+    )
+    _kafka_consumer_thread.start()
+    log.info("Kafka consumer thread launched.")
+
+
+@app.on_event("shutdown")
+async def stop_kafka_consumer() -> None:
+    """Signal the Kafka consumer thread to stop and wait for it to finish."""
+    global _kafka_consumer_thread
+    _kafka_consumer_stop.set()
+    if _kafka_consumer_thread and _kafka_consumer_thread.is_alive():
+        _kafka_consumer_thread.join(timeout=5)
+        log.info("Kafka consumer thread stopped.")
+    # Flush any outstanding producer messages
+    if _kafka_producer is not None:
+        _kafka_producer.flush(timeout=3)
+        log.info("Kafka producer flushed and closed.")
 
 
 if __name__ == "__main__":
